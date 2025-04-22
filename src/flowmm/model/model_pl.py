@@ -336,14 +336,14 @@ class MaterialsRFMLitModule(ManifoldFMLitModule):
         anneal_coords = self.cfg.integrate.get("inference_anneal_coords", True)
         anneal_lattice = self.cfg.integrate.get("inference_anneal_lattice", False)
 
-        print(
-            "Anneal Types:",
-            anneal_types,
-            "Anneal Coords:",
-            anneal_coords,
-            "Anneal Lattice:",
-            anneal_lattice,
-        )
+        # print(
+        #     "Anneal Types:",
+        #     anneal_types,
+        #     "Anneal Coords:",
+        #     anneal_coords,
+        #     "Anneal Lattice:",
+        #     anneal_lattice,
+        # )
 
         def scheduled_fn_to_integrate(
             t: torch.Tensor, x: torch.Tensor, cond: torch.Tensor | None = None
@@ -395,7 +395,7 @@ class MaterialsRFMLitModule(ManifoldFMLitModule):
                 method=self.cfg.integrate.get("method", "euler"),
                 projx=True,
                 local_coords=False,
-                pbar=True,
+                pbar=False,
             )
             return x1
 
