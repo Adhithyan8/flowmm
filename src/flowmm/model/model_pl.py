@@ -16,11 +16,9 @@ from pytorch_lightning.utilities.warnings import PossibleUserWarning
 from torch.func import jvp, vjp
 from torch_geometric.data import Data
 from torchmetrics import MeanMetric, MinMetric
+from tqdm import tqdm
 
 from diffcsp.common.data_utils import lattices_to_params_shape
-from manifm.ema import EMA
-from manifm.model_pl import ManifoldFMLitModule, div_fn, output_and_div
-from manifm.solvers import projx_integrator, projx_integrator_return_last
 from flowmm.model.arch import CSPNet, ProjectedConjugatedCSPNet
 from flowmm.model.solvers import (
     projx_cond_integrator_return_last,
@@ -30,7 +28,20 @@ from flowmm.model.standardize import get_affine_stats
 from flowmm.rfm.manifold_getter import Dims, ManifoldGetter
 from flowmm.rfm.manifolds.spd import SPDGivenN, SPDNonIsotropicRandom
 from flowmm.rfm.vmap import VMapManifolds
+from manifm.ema import EMA
+from manifm.model_pl import ManifoldFMLitModule, div_fn, output_and_div
+from manifm.solvers import (
+    euler_step,
+    midpoint_step,
+    projx_integrator,
+    projx_integrator_return_last,
+    rk4_step,
+)
 
+"""
+ODE solver, gen_sample, and finish_sampling function are duplicated 
+without torch.no_grad to enable gradient tracking
+"""
 
 def output_and_div(
     vecfield: callable[[torch.Tensor], torch.Tensor],
@@ -47,6 +58,32 @@ def output_and_div(
         div = torch.sum(vJ * v, dim=-1)
     return dx, div
 
+def projx_integrator_return_last_with_grad(
+    manifold, odefunc, x0, t, method="euler", projx=True, local_coords=False, pbar=False
+):
+    """Has a lower memory cost since this doesn't store intermediate values."""
+
+    step_fn = {
+        "euler": euler_step,
+        "midpoint": midpoint_step,
+        "rk4": rk4_step,
+    }[method]
+
+    xt = x0
+
+    t0s = t[:-1]
+    if pbar:
+        t0s = tqdm(t0s)
+
+    for t0, t1 in zip(t0s, t[1:]):
+        dt = t1 - t0
+        vt = odefunc(t0, xt)
+        xt = step_fn(
+            odefunc, xt, vt, t0, dt, manifold=manifold if local_coords else None
+        )
+        if projx:
+            xt = manifold.projx(xt)
+    return xt
 
 class MaterialsRFMLitModule(ManifoldFMLitModule):
     def __init__(self, cfg: DictConfig):
@@ -258,6 +295,47 @@ class MaterialsRFMLitModule(ManifoldFMLitModule):
             num_steps=num_steps,
             entire_traj=entire_traj,
         )
+    
+    def gen_sample_with_grad(
+        self,
+        node2graph: torch.LongTensor,
+        dim_coords: int,
+        x0: torch.Tensor = None,
+        num_steps: int = 1_000,
+        entire_traj: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        (
+            shape,
+            manifold,
+            a_manifold,
+            f_manifold,
+            l_manifold,
+            dims,
+            mask_a_or_f,
+        ) = self.manifold_getter.from_empty_batch(
+            node2graph, dim_coords, split_manifold=True
+        )
+        num_atoms = self.manifold_getter._get_num_atoms(mask_a_or_f)
+
+        if x0 is None:
+            assert not self.cfg.base_distribution_from_data, "Need to sample from the base distribution"
+            x0 = manifold.random(*shape, device=node2graph.device)
+        else:
+            x0 = x0.to(device=node2graph.device)
+
+        return self.finish_sampling_with_grad(
+            x0=x0,
+            manifold=manifold,
+            a_manifold=a_manifold,
+            f_manifold=f_manifold,
+            l_manifold=l_manifold,
+            dims=dims,
+            num_atoms=num_atoms,
+            node2graph=node2graph,
+            mask_a_or_f=mask_a_or_f,
+            num_steps=num_steps,
+            entire_traj=entire_traj,
+        )
 
     @torch.no_grad()
     def pred_sample(
@@ -388,6 +466,122 @@ class MaterialsRFMLitModule(ManifoldFMLitModule):
             )
         else:
             x1 = projx_integrator_return_last(
+                manifold,
+                scheduled_fn_to_integrate,
+                x0,
+                t=torch.linspace(0, 1, num_steps + 1).to(x0.device),
+                method=self.cfg.integrate.get("method", "euler"),
+                projx=True,
+                local_coords=False,
+                pbar=False,
+            )
+            return x1
+
+        if compute_traj_velo_norms:
+            s = 0
+            e = dims.a
+            norm_a = a_manifold.inner(
+                xs[..., s:e], vs[..., s:e], vs[..., s:e], data_in_dim=1
+            )
+
+            s = e
+            e += dims.f
+            norm_f = f_manifold.inner(
+                xs[..., s:e], vs[..., s:e], vs[..., s:e], data_in_dim=1
+            )
+
+            s = e
+            e += dims.l
+            norm_l = l_manifold.inner(
+                xs[..., s:e], vs[..., s:e], vs[..., s:e], data_in_dim=1
+            )
+
+        if entire_traj and compute_traj_velo_norms:
+            return xs, norm_a, norm_f, norm_l
+        elif entire_traj and not compute_traj_velo_norms:
+            return xs
+        elif not entire_traj and compute_traj_velo_norms:
+            return xs[0], norm_a, norm_f, norm_l
+        else:
+            # this should happen due to logic above
+            return xs[0]
+        
+    def finish_sampling_with_grad(
+        self,
+        x0: torch.Tensor,
+        manifold: VMapManifolds,
+        a_manifold: VMapManifolds,
+        f_manifold: VMapManifolds,
+        l_manifold: VMapManifolds,
+        dims: Dims,
+        num_atoms: torch.LongTensor,
+        node2graph: torch.LongTensor,  # aka batch.batch
+        mask_a_or_f: torch.BoolTensor,
+        num_steps: int,
+        entire_traj: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        vecfield = partial(
+            self.vecfield,
+            num_atoms=num_atoms,
+            node2graph=node2graph,
+            dims=dims,
+            mask_a_or_f=mask_a_or_f,
+        )
+
+        compute_traj_velo_norms = self.cfg.integrate.get(
+            "compute_traj_velo_norms", False
+        )
+
+        c = self.cfg.integrate.get("inference_anneal_slope", 0.0)
+        b = self.cfg.integrate.get("inference_anneal_offset", 0.0)
+
+        anneal_types = self.cfg.integrate.get("inference_anneal_types", False)
+        anneal_coords = self.cfg.integrate.get("inference_anneal_coords", True)
+        anneal_lattice = self.cfg.integrate.get("inference_anneal_lattice", False)
+
+        def scheduled_fn_to_integrate(
+            t: torch.Tensor, x: torch.Tensor, cond: torch.Tensor | None = None
+        ) -> torch.Tensor:
+            anneal_factor = self._annealing_schedule(t, c, b)
+            out = vecfield(
+                t=torch.atleast_2d(t),
+                x=torch.atleast_2d(x),
+                manifold=manifold,
+                cond=torch.atleast_2d(cond) if isinstance(cond, torch.Tensor) else cond,
+            )
+            if anneal_types:
+                out[:, : dims.a].mul_(anneal_factor)
+            if anneal_coords:
+                out[:, dims.a : -dims.l].mul_(anneal_factor)
+            if anneal_lattice:
+                out[:, -dims.l :].mul_(anneal_factor)
+            return out
+
+        if self.cfg.model.get("self_cond", False):
+            x1 = projx_cond_integrator_return_last(
+                manifold,
+                scheduled_fn_to_integrate,
+                x0,
+                t=torch.linspace(0, 1, num_steps + 1).to(x0.device),
+                method=self.cfg.integrate.get("method", "euler"),
+                projx=True,
+                local_coords=False,
+                pbar=True,
+            )
+            return x1
+
+        elif entire_traj or compute_traj_velo_norms:
+            xs, vs = projx_integrator(
+                manifold,
+                scheduled_fn_to_integrate,
+                x0,
+                t=torch.linspace(0, 1, num_steps + 1).to(x0.device),
+                method=self.cfg.integrate.get("method", "euler"),
+                projx=True,
+                pbar=True,
+            )
+        else:
+            x1 = projx_integrator_return_last_with_grad(
                 manifold,
                 scheduled_fn_to_integrate,
                 x0,
