@@ -253,6 +253,44 @@ class MaterialsRFMLitModule(ManifoldFMLitModule):
             num_steps=num_steps,
             entire_traj=entire_traj,
         )
+    
+    @torch.no_grad()
+    def gen_sample_xt(
+        self,
+        node2graph: torch.LongTensor,
+        dim_coords: int,
+        t: float,
+        xt: torch.Tensor,
+        num_steps: int = 1_000,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        (
+            shape,
+            manifold,
+            a_manifold,
+            f_manifold,
+            l_manifold,
+            dims,
+            mask_a_or_f,
+        ) = self.manifold_getter.from_empty_batch(
+            node2graph, dim_coords, split_manifold=True
+        )
+        num_atoms = self.manifold_getter._get_num_atoms(mask_a_or_f)
+
+        xt = xt.to(device=node2graph.device)
+
+        return self.finish_sampling_xt(
+            t=t,
+            xt=xt,
+            manifold=manifold,
+            a_manifold=a_manifold,
+            f_manifold=f_manifold,
+            l_manifold=l_manifold,
+            dims=dims,
+            num_atoms=num_atoms,
+            node2graph=node2graph,
+            mask_a_or_f=mask_a_or_f,
+            num_steps=num_steps,
+        )
 
     @torch.no_grad()
     def gen_sample(
@@ -379,6 +417,66 @@ class MaterialsRFMLitModule(ManifoldFMLitModule):
             num_steps=num_steps,
             entire_traj=entire_traj,
         )
+    
+    @torch.no_grad()
+    def finish_sampling_xt(
+        self,
+        t: float,
+        xt: torch.Tensor,
+        manifold: VMapManifolds,
+        a_manifold: VMapManifolds,
+        f_manifold: VMapManifolds,
+        l_manifold: VMapManifolds,
+        dims: Dims,
+        num_atoms: torch.LongTensor,
+        node2graph: torch.LongTensor,  # aka batch.batch
+        mask_a_or_f: torch.BoolTensor,
+        num_steps: int,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        vecfield = partial(
+            self.vecfield,
+            num_atoms=num_atoms,
+            node2graph=node2graph,
+            dims=dims,
+            mask_a_or_f=mask_a_or_f,
+        )
+
+        c = self.cfg.integrate.get("inference_anneal_slope", 0.0)
+        b = self.cfg.integrate.get("inference_anneal_offset", 0.0)
+
+        anneal_types = self.cfg.integrate.get("inference_anneal_types", False)
+        anneal_coords = self.cfg.integrate.get("inference_anneal_coords", True)
+        anneal_lattice = self.cfg.integrate.get("inference_anneal_lattice", False)
+
+        def scheduled_fn_to_integrate(
+            t: torch.Tensor, x: torch.Tensor, cond: torch.Tensor | None = None
+        ) -> torch.Tensor:
+            anneal_factor = self._annealing_schedule(t, c, b)
+            out = vecfield(
+                t=torch.atleast_2d(t),
+                x=torch.atleast_2d(x),
+                manifold=manifold,
+                cond=torch.atleast_2d(cond) if isinstance(cond, torch.Tensor) else cond,
+            )
+            if anneal_types:
+                out[:, : dims.a].mul_(anneal_factor)
+            if anneal_coords:
+                out[:, dims.a : -dims.l].mul_(anneal_factor)
+            if anneal_lattice:
+                out[:, -dims.l :].mul_(anneal_factor)
+            return out
+
+        x1 = projx_integrator_return_last(
+            manifold,
+            scheduled_fn_to_integrate,
+            xt,
+            t=torch.linspace(t, 1, num_steps + 1).to(xt.device),
+            method=self.cfg.integrate.get("method", "euler"),
+            projx=True,
+            local_coords=False,
+            pbar=False,
+        )
+        return x1
 
     @torch.no_grad()
     def finish_sampling(
